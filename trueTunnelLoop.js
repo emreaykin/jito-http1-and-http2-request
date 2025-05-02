@@ -101,7 +101,7 @@ async function runLoop(clients, round = 1) {
 
   await Promise.all(clients.map(async (client, idx) => {
     try {
-      const t = await withTimeout(sendRequestWithClient(client), 1500);
+      const t = await withTimeout(sendRequestWithClient(client), 1000);
       success++;
       times.push(t);
     } catch (err) {

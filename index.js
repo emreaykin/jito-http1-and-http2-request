@@ -1,12 +1,19 @@
-const http2 = require('http2');
-const net = require('net');
-const tls = require('tls');
-const fs = require('fs');
-const path = require('path');
-const { URL } = require('url');
+// persistent-http2-proxy-loop.js
+const http2  = require('http2');
+const net    = require('net');
+const tls    = require('tls');
+const fs     = require('fs');
+const path   = require('path');
+const { URL }= require('url');
+const { performance } = require('perf_hooks');
 
-const urlStr = 'https://quote-api.jup.ag/v6/quote?inputMint=EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v&outputMint=So11111111111111111111111111111111111111112&amount=1000000&slippageBps=200&swapMode=ExactIn&onlyDirectRoutes=false&asLegacyTransaction=false&maxAccounts=28&minimizeSlippage=false';
+const urlStr ="https://ultra-api.jup.ag/order?inputMint=EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v&outputMint=So11111111111111111111111111111111111111112&amount=1000000&swapMode=ExactIn";
 
+const REQUIRED_KEYS = [
+  'inputMint', 'inAmount', 'outputMint', 'outAmount', 'routePlan'
+];
+
+/* ------------------------------------------------------------------ */
 function loadProxiesFromFile(filePath = 'proxy.txt') {
   const file = fs.readFileSync(path.resolve(__dirname, filePath), 'utf-8');
   return file
@@ -21,124 +28,141 @@ function loadProxiesFromFile(filePath = 'proxy.txt') {
 
 function createTunnel(targetHost, targetPort, proxyUrlStr) {
   return new Promise((resolve, reject) => {
-    const proxy = new URL(proxyUrlStr);
+    const proxy  = new URL(proxyUrlStr);
     const socket = net.connect(proxy.port, proxy.hostname, () => {
-      let connectReq = `CONNECT ${targetHost}:${targetPort} HTTP/1.1\r\n`;
-      connectReq += `Host: ${targetHost}:${targetPort}\r\n`;
+      let req  = `CONNECT ${targetHost}:${targetPort} HTTP/1.1\r\n`;
+      req     += `Host: ${targetHost}:${targetPort}\r\n`;
       if (proxy.username && proxy.password) {
         const auth = Buffer.from(`${proxy.username}:${proxy.password}`).toString('base64');
-        connectReq += `Proxy-Authorization: Basic ${auth}\r\n`;
+        req += `Proxy-Authorization: Basic ${auth}\r\n`;
       }
-      connectReq += `\r\n`;
-      socket.write(connectReq);
+      req += `\r\n`;
+      socket.write(req);
     });
-    socket.once('data', (chunk) => {
-      const response = chunk.toString();
-      if (response.indexOf('200') !== -1) {
-        resolve(socket);
-      } else {
-        reject(new Error('Proxy CONNECT failed: ' + response));
-      }
+
+    socket.once('data', chunk => {
+      const resp = chunk.toString();
+      resp.includes('200') ? resolve(socket)
+                           : reject(new Error('Proxy CONNECT failed: ' + resp.split('\r\n')[0]));
     });
     socket.on('error', reject);
   });
 }
 
-// Persistent client ile HTTP/2 request gönder
+/* ------------------------------------------------------------------ */
+// — yardımcılar —
+const wait = ms => new Promise(r => setTimeout(r, ms));
+
+function withTimeout(promise, ms) {
+  return Promise.race([
+    promise,
+    new Promise((_, rej) => setTimeout(() => rej(new Error('Timeout')), ms))
+  ]);
+}
+
+/* ------------------------------------------------------------------ */
 function sendRequestWithClient(client) {
   return new Promise((resolve, reject) => {
     const urlObj = new URL(urlStr);
-    const start = process.hrtime();
+    const t0     = performance.now();
 
     const req = client.request({
       ':method': 'GET',
-      ':path': urlObj.pathname + urlObj.search,
+      ':path'  : urlObj.pathname + urlObj.search,
     });
 
-    req.setEncoding('utf8');
     let body = '';
-    req.on('data', chunk => (body += chunk));
+    req.setEncoding('utf8');
+    req.on('data', chunk => body += chunk);
     req.on('end', () => {
-      const diff = process.hrtime(start);
-      const time = diff[0] * 1000 + diff[1] / 1e6;
-      resolve(time);
+      const t1   = performance.now();
+      try {
+        const data = JSON.parse(body);
+        // zorunlu alanlar var mı?
+        const ok = REQUIRED_KEYS.every(k => data.hasOwnProperty(k));
+        return ok ? resolve(t1 - t0)
+                  : reject(new Error('Yanıt formatı beklenen değil'));
+      } catch (_) {
+        reject(new Error('JSON parse hatası'));
+      }
     });
     req.on('error', reject);
     req.end();
   });
 }
 
-async function startPersistentLoop(clients, intervalMs = 2000) {
-  console.log(`\n🔁 Sürekli istek döngüsü başlıyor... (her ${intervalMs} ms'de bir)\n`);
+/* ------------------------------------------------------------------ */
+// — ana döngü —
+async function runLoop(clients, round = 1) {
+  console.log(`🌀 Döngü ${round}`);
 
-  let counter = 1;
-  let totalRequests = 0;
+  let success = 0;
+  const times = [];
 
-  setInterval(async () => {
-    console.log(`🌀 Döngü ${counter++}`);
+  await Promise.all(clients.map(async (client, idx) => {
+    try {
+      const t = await withTimeout(sendRequestWithClient(client), 1500);
+      success++;
+      times.push(t);
+    } catch (err) {
+      console.error(`Proxy #${idx + 1} → Hata: ${err.message}`);
+    }
+  }));
 
-    let successfulThisRound = 0;
+  const max  = times.length ? Math.max(...times) : 0;
+  console.log(`⏱ Başarılı istek: ${success}/${clients.length}`);
+  console.log(`🚀 En uzun süre: ${max.toFixed(2)} ms`);
+  console.log('-----------------------------------------------------\n');
 
-    const results = await Promise.all(
-      clients.map((client, i) => {
-        return sendRequestWithClient(client)
-          .then(time => {
-            successfulThisRound++;
-            totalRequests++;
-            console.log(`Proxy #${i + 1} → Süre: ${time.toFixed(2)} ms`);
-            return time;
-          })
-          .catch(err => {
-            console.error(`Proxy #${i + 1} → Hata: ${err.message}`);
-            return 0;
-          });
-      })
-    );
-
-    const max = Math.max(...results);
-    console.log(`⏱ Bu turda atılan istek sayısı: ${successfulThisRound}`);
-    console.log(`📦 Toplam istek sayısı: ${totalRequests}`);
-    console.log(`🚀 En uzun süre: ${max.toFixed(2)} ms`);
-    console.log('-----------------------------------------------------\n');
-  }, intervalMs);
+  // 1 sn’den erken bittiyse, aradaki fark kadar bekle
+  const delay = max < 1000 ? 1000 - max : 0;
+  await wait(delay);
+  return runLoop(clients, round + 1);  // sıradaki döngü
 }
 
-
-
-// Giriş noktası
+/* ------------------------------------------------------------------ */
+// — giriş noktası —
 (async () => {
   const proxies = loadProxiesFromFile('proxy.txt');
-  const urlObj = new URL(urlStr);
+  const urlObj  = new URL(urlStr);
 
-  // Her proxy için kalıcı bağlantılar kur
   const clients = await Promise.all(
     proxies.map(async (proxy, i) => {
+      const t0 = performance.now();
       try {
         const socket = await createTunnel(urlObj.hostname, 443, proxy);
-        const tlsSocket = await new Promise((resolve, reject) => {
-          const tlsSock = tls.connect({
+        const tlsSocket = await new Promise((res, rej) => {
+          const s = tls.connect({
             socket,
-            servername: urlObj.hostname,
+            servername   : urlObj.hostname,
             ALPNProtocols: ['h2'],
           });
-          tlsSock.on('secureConnect', () => resolve(tlsSock));
-          tlsSock.on('error', reject);
+          s.on('secureConnect', () => res(s));
+          s.on('error', rej);
         });
 
         const client = http2.connect(urlObj.origin, {
           createConnection: () => tlsSocket,
         });
+        client.on('error', e => console.error(`Client #${i + 1} H2 err:`, e.message));
 
-        client.on('error', err => console.error(`Client #${i + 1} HTTP/2 error:`, err.message));
+        const dt = performance.now() - t0;
+        console.log(`✅ Proxy #${i + 1} tünel hazır → ${dt.toFixed(2)} ms`);
+
         return client;
       } catch (err) {
-        console.error(`Proxy ${i + 1} bağlantı kurulamadı:`, err.message);
+        console.error(`❌ Proxy #${i + 1} açılmadı:`, err.message);
         return null;
       }
     })
   );
 
-  // Geçerli client'larla döngüyü başlat
-  const validClients = clients.filter(Boolean);
-  await startPersistentLoop(validClients, 2000); // her 2 saniyede bir döner
+  const valid = clients.filter(Boolean);
+  if (!valid.length) {
+    console.error('Çalışacak proxy bulunamadı.');
+    process.exit(1);
+  }
+
+  console.log(`\n🔁 Sürekli istek döngüsü başlıyor…\n`);
+  await runLoop(valid);
 })();
